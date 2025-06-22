@@ -11,7 +11,6 @@ const b64url = {
   }
 };
 
-// --- Helper: send responses ---
 function send(res, body, type = 'text/html', code = 200) {
   res.statusCode = code;
   res.setHeader('Content-Type', type);
@@ -19,22 +18,6 @@ function send(res, body, type = 'text/html', code = 200) {
   res.end(type.startsWith('application/json') ? JSON.stringify(body) : body);
 }
 
-// --- Manifest for Stremio ---
-const MANIFEST = {
-  id: 'community.imdb-top-picks',
-  version: '2.0.0',
-  name: 'IMDb Top Picks',
-  description: 'Personalized IMDb "Top Picks" for your account.',
-  types: ['movie', 'series'],
-  catalogs: [
-    { id: 'imdb-top-picks', type: 'movie',  name: 'IMDB Top Picks – Movies' },
-    { id: 'imdb-top-picks', type: 'series', name: 'IMDB Top Picks – Series' }
-  ],
-  resources: ['catalog', 'meta'],
-  behaviorHints: { configurable: false }
-};
-
-// --- Helper page for cookie input ---
 const PAGE = `<!doctype html><meta charset=utf8>
 <title>IMDb Top Picks → Stremio</title>
 <style>
@@ -62,7 +45,6 @@ go.onclick=()=>{
 };
 </script>`;
 
-// --- GraphQL API endpoint and static payload for Top Picks ---
 const API_URL = 'https://api.graphql.imdb.com/';
 const API_BODY = {
   operationName: "TopPicksTab",
@@ -79,8 +61,81 @@ const API_BODY = {
   }
 };
 
-// --- Scraper: fetch and parse Top Picks via GraphQL ---
-async function scrape(cookie) {
+// --- Helper to extract genres from GraphQL response ---
+function extractGenresFromData(data) {
+  const genresSet = new Set();
+  const edges = data?.data?.titleRecommendations?.edges || [];
+  for (const edge of edges) {
+    const genresArr = edge.node?.title?.titleGenres?.genres || [];
+    for (const g of genresArr) {
+      if (g?.genre?.text) genresSet.add(g.genre.text);
+    }
+  }
+  return Array.from(genresSet).sort();
+}
+
+// --- Helper to build Stremio meta object from an edge ---
+function buildMeta(edge) {
+  const t = edge.node?.title;
+  if (!t || !t.id) return null;
+  const genres = (t.titleGenres?.genres || []).map(g => g.genre.text).filter(Boolean);
+  return {
+    id: t.id,
+    type: (t.titleType?.id === 'tvSeries' || t.titleType?.id === 'tvMiniSeries') ? 'series' : 'movie',
+    name: t.titleText?.text || t.originalTitleText?.text || 'IMDb title',
+    poster: t.primaryImage?.url || '',
+    year: t.releaseYear?.year,
+    genres,
+    posterShape: 'poster',
+    imdbRating: t.ratingsSummary?.aggregateRating
+  };
+}
+
+// --- Helper: parse genre (and other extras) from Stremio path ---
+function parseExtrasFromPath(path) {
+  const parts = path.split('/');
+  let extrasStr = parts[4] || '';
+  extrasStr = extrasStr.replace(/\.json$/, '');
+  const extras = {};
+  if (extrasStr && extrasStr.includes('=')) {
+    // support multiple extras: genre=Action,year=2020
+    extrasStr.split(',').forEach(pair => {
+      const [k, v] = pair.split('=');
+      if (k && v) extras[k] = v;
+    });
+  }
+  return extras;
+}
+
+const BASE_MANIFEST = {
+  id: 'community.imdb-top-picks',
+  version: '2.4.0',
+  name: 'IMDb Top Picks',
+  description: 'Personalized IMDb "Top Picks" for your account.',
+  types: ['movie', 'series'],
+  catalogs: [
+    {
+      id: 'imdb-top-picks',
+      type: 'movie',
+      name: 'IMDB Top Picks – Movies',
+      extra: [
+        { name: "genre", isRequired: false, options: [] }
+      ]
+    },
+    {
+      id: 'imdb-top-picks',
+      type: 'series',
+      name: 'IMDB Top Picks – Series',
+      extra: [
+        { name: "genre", isRequired: false, options: [] }
+      ]
+    }
+  ],
+  resources: ['catalog', 'meta'],
+  behaviorHints: { configurable: false }
+};
+
+async function fetchImdbData(cookie) {
   let response;
   try {
     response = await axios.post(API_URL, API_BODY, {
@@ -95,32 +150,15 @@ async function scrape(cookie) {
   } catch (e) {
     throw new Error('Request to IMDb GraphQL failed: ' + (e.response?.status || '') + ' ' + (e.message || ''));
   }
-
-  const edges = response?.data?.data?.titleRecommendations?.edges || [];
-  if (!edges.length && response?.data?.errors) {
+  if (!response?.data?.data?.titleRecommendations?.edges?.length && response?.data?.errors) {
     const msg = response.data.errors.map(e => e.message).join(', ');
     if (msg.match(/auth/i) || msg.match(/login/i))
       throw new Error('Login required or cookie expired.');
     throw new Error('IMDb GraphQL error: ' + msg);
   }
-  if (!edges.length) throw new Error('No Top Picks found for this account.');
-
-  return edges.map(edge => {
-    const t = edge.node?.title;
-    if (!t || !t.id) return null;
-    return {
-      id: t.id,
-      type: t.titleType?.id === 'tvSeries' || t.titleType?.id === 'tvMiniSeries' ? 'series' : 'movie',
-      name: t.titleText?.text || t.originalTitleText?.text || 'IMDb title',
-      poster: t.primaryImage?.url || '',
-      year: t.releaseYear?.year,
-      posterShape: 'poster',
-      imdbRating: t.ratingsSummary?.aggregateRating
-    };
-  }).filter(Boolean);
+  return response.data;
 }
 
-// --- Stremio serverless handler ---
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -138,21 +176,38 @@ export default async function handler(req, res) {
   // Helper page for cookie input
   if (tail === '/' || tail === '/index.html') return send(res, PAGE);
 
-  // Manifest endpoint
+  // Manifest endpoint: dynamically offer genres
   if (tail === '/manifest.json') {
     const cookie = hash ? b64url.decode(hash) : '';
-    return send(
-      res,
-      cookie ? { ...MANIFEST, id: MANIFEST.id + '.' + hash } : MANIFEST,
-      'application/json'
-    );
+    let genres = [];
+    if (cookie) {
+      try {
+        const imdbData = await fetchImdbData(cookie);
+        genres = extractGenresFromData(imdbData);
+      } catch (e) {
+        // fallback to empty, don't block manifest on fetch fail
+      }
+    }
+    // Deep clone BASE_MANIFEST and inject genres
+    const manifest = JSON.parse(JSON.stringify(BASE_MANIFEST));
+    manifest.catalogs.forEach(cat => {
+      cat.extra[0].options = genres;
+    });
+    manifest.id = cookie ? manifest.id + '.' + hash : manifest.id;
+    return send(res, manifest, 'application/json');
   }
 
-  // Catalog endpoint
+  // --- CATALOG ENDPOINT WITH GENRE FILTERING ---
   if (tail.startsWith('/catalog/')) {
-    const [, , type, file] = tail.split('/');
-    if (file !== 'imdb-top-picks.json')
+    // Example: /catalog/movie/imdb-top-picks/genre=Action.json
+    const parts = tail.split('/');
+    const type = parts[2];
+    const id = parts[3];
+    if (!id.startsWith('imdb-top-picks'))
       return send(res, { error: 'Unknown catalog' }, 'application/json', 404);
+
+    // Parse extras from path (like genre)
+    const extras = parseExtrasFromPath(tail);
 
     const cookie = hash ? b64url.decode(hash) : '';
     if (!cookie)
@@ -163,7 +218,21 @@ export default async function handler(req, res) {
         400
       );
     try {
-      const metas = (await scrape(cookie)).filter(m => m.type === type);
+      const imdbData = await fetchImdbData(cookie);
+      let metas = (imdbData.data.titleRecommendations.edges || [])
+        .map(buildMeta)
+        .filter(Boolean)
+        .filter(m => m.type === type);
+
+      // Genre filter (case-insensitive)
+      if (extras.genre) {
+        const reqGenre = extras.genre.toLowerCase();
+        metas = metas.filter(m =>
+          Array.isArray(m.genres) &&
+          m.genres.some(g => g.toLowerCase() === reqGenre)
+        );
+      }
+
       return send(res, { metas }, 'application/json');
     } catch (e) {
       console.error('[scrape]', e);
